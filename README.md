@@ -14,4 +14,6 @@ pip install -r requirements.txt
 python3 repair_photos_bookmarks.py
 follow the prompts
 
-## For more information, see this [discussion](https://github.com/RhetTbull/osxphotos/discussions/319)
+## Additional Information
+
+For more information, see this [discussion](https://github.com/RhetTbull/osxphotos/discussions/319)
