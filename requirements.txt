@@ -1,3 +1,4 @@
 click>=8.0
 pyobjc>=7.3,<9.0
-photoscript>=0.1.5
+photoscript>=0.1.
+psutil>=5.8.0,<6.0

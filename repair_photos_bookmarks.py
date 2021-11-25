@@ -4,6 +4,7 @@ import os
 import pathlib
 import sqlite3
 import urllib
+import psutil
 
 import click
 import CoreFoundation
@@ -37,6 +38,11 @@ def copy_temporary_photos_library():
 def verify_temp_library_signature():
     """Verify that the loaded library is actually the temporary working library"""
     return PhotosLibrary().album(TEMP_LIBRARY_SENTINEL_ALBUM) is not None
+
+
+def photos_is_running():
+    """Check if Photos is running"""
+    return any(p.name() == "Photos" for p in psutil.process_iter())
 
 
 def open_sqlite_db(fname: str):
@@ -224,6 +230,13 @@ def main(photos_library_path, verbose, debug_skip_import):
         abort=True,
     )
 
+    while photos_is_running():
+        click.secho("Photos is still running, please quit it", fg="red", err=True)
+        click.confirm(
+            "Please quit Photos.\n" "Type 'y' when you have done this.",
+            abort=True,
+        )
+
     click.echo("Creating a temporary working Photos library.")
     temp_library_path = copy_temporary_photos_library()
     click.echo(f"Created temporary Photos library at: {temp_library_path}")
@@ -233,6 +246,14 @@ def main(photos_library_path, verbose, debug_skip_import):
         "Type 'y' when you have done this.",
         abort=True,
     )
+
+    if not photos_is_running():
+        click.secho("Photos is not running, please open it", fg="red", err=True)
+        click.confirm(
+            "Please open Photos while holding down the Option key then select the temporary working library.\n"
+            "Type 'y' when you have done this.",
+            abort=True,
+        )
 
     while not verify_temp_library_signature():
         click.secho(
@@ -265,6 +286,13 @@ def main(photos_library_path, verbose, debug_skip_import):
         "Please quit Photos.\n" "Type 'y' when you have done this.",
         abort=True,
     )
+    while photos_is_running():
+        click.secho("Photos is still running, please quit it", fg="red", err=True)
+        click.confirm(
+            "Please quit Photos.\n" "Type 'y' when you have done this.",
+            abort=True,
+        )
+
     temp_db_path = pathlib.Path(temp_library_path) / "database/Photos.sqlite"
     bookmarks = read_bookmarks_from_photos_database(temp_db_path)
 
@@ -276,6 +304,14 @@ def main(photos_library_path, verbose, debug_skip_import):
         "Type 'y' when you have done this.",
         abort=True,
     )
+
+    while not photos_is_running():
+        click.secho("Photos is not running, please open it", fg="red", err=True)
+        click.confirm(
+            f"Please open Photos while holding down the Option key then select your target library: {photos_library_path}\n"
+            "Type 'y' when you have done this.",
+            abort=True,
+        )
 
     while verify_temp_library_signature():
         click.secho(
