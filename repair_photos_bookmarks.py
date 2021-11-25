@@ -13,6 +13,8 @@ from Foundation import kCFAllocatorDefault
 from photoscript import PhotosLibrary
 from photoscript.utils import ditto
 
+_verbose = 0 
+
 TEMPLATE_DIRECTORY = "template_libraries"
 TEMPLATE_LIBRARY = {
     (10, 15): "osxphotos_temporary_working_library_catalina.photoslibrary"
@@ -123,6 +125,8 @@ def read_file_locations_from_photos_database(photos_db_path):
             try:
                 bookmark_path = resolve_cfdata_bookmark(bookmark_data)
                 referenced_files[pk] = bookmark_path
+                if _verbose > 1:
+                    click.secho(f"... will import path '{bookmark_path}'", fg="green")
             except ValueError as e:
                 # if the file is missing, we can't resolve the bookmark
                 click.secho(
@@ -137,6 +141,8 @@ def read_file_locations_from_photos_database(photos_db_path):
 def import_file_to_photos(filepath):
     """import a file into Photos"""
     pl = PhotosLibrary()
+    if _verbose > 2:
+        click.secho(f"... doing import of '{filepath}'", fg="green")
     pl.import_photos([filepath], skip_duplicate_check=True)
 
 
@@ -154,7 +160,7 @@ def read_bookmarks_from_photos_database(photos_db_path):
         if bookmark_data:
             try:
                 bookmark_path = resolve_cfdata_bookmark(bookmark_data)
-                bookmarks[bookmark_path] = bookmark_data
+                bookmarks[pathstr] = bookmark_data
             except ValueError as e:
                 # if the file is missing, we can't resolve the bookmark
                 click.secho(
@@ -165,26 +171,71 @@ def read_bookmarks_from_photos_database(photos_db_path):
     conn.close()
     return bookmarks
 
+def check_if_pathstr_in_filesystem_bookmarks(c, pathstr):
+    c.execute(
+        "SELECT COUNT(*) FROM ZFILESYSTEMBOOKMARK WHERE ZPATHRELATIVETOVOLUME = ?",
+        (pathstr, )
+    )
+    for row in c:
+        if row[0] == 0:
+            return False
+        elif row[0] == 1:
+            return True
+        else:
+            click.secho(
+                f"File '{pathstr}' has multiple entries in ZFILESYSTEMBOOKMARK table",
+                err=True,
+                fg="yellow")
+            return True
+
+def get_pathstrs_in_filesystembookmarks(c):
+    pathstrs = set()
+    c.execute(
+        "SELECT ZPATHRELATIVETOVOLUME FROM ZFILESYSTEMBOOKMARK"
+    )
+    for row in c:
+        pathstrs.add(row[0])
+    return pathstrs
+
 
 def update_bookmarks_in_photos_database(photos_db_path, bookmarks):
     """Update bookmarks for referenced files in a Photos library database"""
     # update each bookmark in the database
     (conn, c) = open_sqlite_db(photos_db_path)
+    pathstrs = get_pathstrs_in_filesystembookmarks(c)
+    updated_pathstrs = set()
     for pathstr, bookmark_data in bookmarks.items():
-        click.echo(f"Updating bookmark for {pathstr}")
+        if _verbose > 0:
+            click.secho(f"Updating bookmark for {pathstr}", fg="green")
+        if check_if_pathstr_in_filesystem_bookmarks(c, pathstr) == False:
+            click.secho(f"File '{pathstr}' is not in ZFILESYSTEMBOOKMARK",
+                fg="red", err=True)
         conn.execute(
             "UPDATE ZFILESYSTEMBOOKMARK SET ZBOOKMARKDATA = ? WHERE ZPATHRELATIVETOVOLUME = ?",
             (bytes(bookmark_data), pathstr),
-        )
+            )
+        updated_pathstrs.add(pathstr)
+    if _verbose > 0:
+        missing = pathstrs.difference(updated_pathstrs)
+        for pathstr in missing:
+            click.secho(f"File '{pathstr}' was not updated", fg="yellow", err=True)
+        if len(pathstrs) == 0:
+            click.secho(f"All files were updated", fg="green")
     conn.commit()
     conn.close()
 
 
+
+
 @click.command()
 @click.argument("photos_library_path", type=click.Path(exists=True))
-def main(photos_library_path):
+@click.option('-v', '--verbose', count=True)
+@click.option('--debug-skip-import/--no-debug-skip-import', default=False)
+def main(photos_library_path, verbose, debug_skip_import):
     """Repair photo bookmarks in a Photos sqlite database"""
-
+    global _verbose 
+    _verbose = verbose
+    print(_verbose)
     photos_db_path = pathlib.Path(photos_library_path) / "database/Photos.sqlite"
     if not photos_db_path.is_file():
         raise FileNotFoundError(f"Could not find Photos database at '{photos_db_path}'")
