@@ -4,5 +4,9 @@
 <dict>
 	<key>CollapsedSidebarSectionIdentifiers</key>
 	<array/>
+	<key>ExpandedSidebarItemIdentifiers</key>
+	<array>
+		<string>1BEBE9A6-A05E-4E00-B420-B0E0A20AF4DF/L0/020</string>
+	</array>
 </dict>
 </plist>

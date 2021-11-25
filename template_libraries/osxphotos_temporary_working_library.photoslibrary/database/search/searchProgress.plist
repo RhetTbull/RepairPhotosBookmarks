@@ -3,7 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>insertAlbum</key>
-	<array/>
+	<array>
+		<string>4F9C525B-609E-433B-8152-0AB0D62BD04E</string>
+	</array>
 	<key>insertAsset</key>
 	<array/>
 	<key>insertHighlight</key>
