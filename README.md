@@ -10,13 +10,20 @@ This is a work in progress and it's a bit of hack.  It requires a few manual ste
 
 ## How to use
 
+First, move your Photos library to the new volume or the new computer.  Note: the absolute path to the photos must remain the same.  For example, if your photos were located on an external drive named "Fotos" and in a folder named "MyFotos" the path would `/Volumes/Fotos/MyFotos`, the new volume must also be named "Fotos" and the folder must be named "MyFotos". 
+
 - pip install -r requirements.txt
 - python3 repair_photos_bookmarks.py PATH_TO_PHOTOS_LIBRARY
-- follow the prompts
+- Follow the prompts
 
 ## Contributors
 
 Thanks to [@dgleich](https://github.com/dgleich) for the idea behind this project and for contributing significant research, testing, and code!  This was a joint effort.
+
+## TODO
+
+- [ ] Add option to change the absolute path to the photos
+- [ ] Incorporate as an option to [osxphotos](https://github.com/RhetTbull/osxphotos)
 
 ## Additional Information
 
