@@ -198,7 +198,9 @@ def main(photos_library_path, verbose, debug_skip_import):
     """Repair photo bookmarks in a Photos sqlite database"""
     global _verbose
     _verbose = verbose
-    print(_verbose)
+    if _verbose:
+        print(f"Verbose mode is on, level={_verbose}")
+
     photos_db_path = pathlib.Path(photos_library_path) / "database/Photos.sqlite"
     if not photos_db_path.is_file():
         raise FileNotFoundError(f"Could not find Photos database at '{photos_db_path}'")
@@ -223,9 +225,8 @@ def main(photos_library_path, verbose, debug_skip_import):
     )
 
     click.echo("Creating a temporary working Photos library.")
-
     temp_library_path = copy_temporary_photos_library()
-    click.echo(f"Created temporary Photos library at {temp_library_path}")
+    click.echo(f"Created temporary Photos library at: {temp_library_path}")
 
     click.confirm(
         "Please open Photos while holding down the Option key then select the temporary working library.\n"
@@ -233,13 +234,18 @@ def main(photos_library_path, verbose, debug_skip_import):
         abort=True,
     )
 
-    if not verify_temp_library_signature():
+    while not verify_temp_library_signature():
         click.secho(
-            "Temporary Photos library missing sentinel value. Are you sure you opened the right library?",
+            "Photos library missing sentinel value--does not appear to be temporary library. "
+            "Are you sure you opened the right library?",
             err=True,
             fg="red",
         )
-        raise click.Abort("foo")
+        click.confirm(
+            "Please open Photos while holding down the Option key then select the temporary working library.\n"
+            "Type 'y' when you have done this.",
+            abort=True,
+        )
 
     click.echo("Reading data for referenced files from target library")
     referenced_files = read_file_locations_from_photos_database(photos_db_path)
@@ -266,9 +272,29 @@ def main(photos_library_path, verbose, debug_skip_import):
     update_bookmarks_in_photos_database(photos_db_path, bookmarks)
 
     click.confirm(
-        f"Please open Photos while holding down the Option key then select your target library ({photos_library_path}).\n"
+        f"Please open Photos while holding down the Option key then select your target library: {photos_library_path}\n"
         "Type 'y' when you have done this.",
         abort=True,
+    )
+
+    while verify_temp_library_signature():
+        click.secho(
+            "It appears the temporary Photos library is still open. Are you sure you opened the right library?",
+            err=True,
+            fg="red",
+        )
+        click.confirm(
+            f"Please open Photos while holding down the Option key then select your target library: {photos_library_path}\n"
+            "Type 'y' when you have done this.",
+            abort=True,
+        )
+
+    click.echo(
+        "If you want newly imported files copied into the Photos library, be sure to check the following box in Photos preferences:\n"
+        "'Importing: Copy items to the Photos library'"
+    )
+    click.echo(
+        f"You may now delete the temporary Photos library by dragging it to the recycle bin in Finder: {temp_library_path}"
     )
     click.echo("Done.")
 

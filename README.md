@@ -11,7 +11,7 @@ This is a work in progress and it's a bit of hack.  It requires a few manual ste
 ## How to use
 
 - pip install -r requirements.txt
-- python3 repair_photos_bookmarks.py
+- python3 repair_photos_bookmarks.py PATH_TO_PHOTOS_LIBRARY
 - follow the prompts
 
 ## Additional Information
