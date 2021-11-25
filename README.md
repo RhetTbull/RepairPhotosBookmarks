@@ -10,9 +10,9 @@ This is a work in progress and it's a bit of hack.  It requires a few manual ste
 
 ## How to use
 
-pip install -r requirements.txt
-python3 repair_photos_bookmarks.py
-follow the prompts
+- pip install -r requirements.txt
+- python3 repair_photos_bookmarks.py
+- follow the prompts
 
 ## Additional Information
 

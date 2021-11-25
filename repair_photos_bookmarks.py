@@ -2,67 +2,41 @@
 
 import os
 import pathlib
-import platform
 import sqlite3
-import time
 import urllib
 
 import click
 import CoreFoundation
+import objc
 from Foundation import kCFAllocatorDefault
 from photoscript import PhotosLibrary
 from photoscript.utils import ditto
 
-_verbose = 0 
+_verbose = 0
 
 TEMPLATE_DIRECTORY = "template_libraries"
-TEMPLATE_LIBRARY = {
-    (10, 15): "osxphotos_temporary_working_library_catalina.photoslibrary"
-}
-
-
-def get_os_version():
-    import platform
-
-    # returns tuple containing OS version
-    # e.g. 10.13.6 = (10, 13, 6)
-    version = platform.mac_ver()[0].split(".")
-    if len(version) == 2:
-        (ver, major) = version
-        minor = 0
-    elif len(version) == 3:
-        (ver, major, minor) = version
-    else:
-        raise (
-            ValueError(
-                f"Could not parse version string: {platform.mac_ver()} {version}"
-            )
-        )
-    return (int(ver), int(major), int(minor))
+TEMPLATE_LIBRARY = "osxphotos_temporary_working_library.photoslibrary"
+TEMP_LIBRARY_SENTINEL_ALBUM = "ZZZ_OSXPHOTOS_SENTINEL_ZZZ"
 
 
 def copy_temporary_photos_library():
     """copy the template library and open Photos, returns path to copied library"""
-    ver, major, minor = get_os_version()
-    if ver == 10:
-        template_library = TEMPLATE_LIBRARY.get((ver, major))
-    else:
-        # MacOS versions after Catalina are 11, 12, etc. not 10.X
-        template_library = TEMPLATE_LIBRARY.get((ver))
-    if not template_library:
-        raise ValueError(f"No template library for version {ver}.{major}.{minor}")
-
-    src = pathlib.Path(TEMPLATE_DIRECTORY) / template_library
+    src = pathlib.Path(TEMPLATE_DIRECTORY) / TEMPLATE_LIBRARY
 
     # is picture folder always here independent of locale or language?
     picture_folder = pathlib.Path("~/Pictures").expanduser()
     if not picture_folder.is_dir():
         raise FileNotFoundError(f"Invalid picture folder: '{picture_folder}'")
 
-    dest = picture_folder / template_library
+    dest = picture_folder / TEMPLATE_LIBRARY
     ditto(src, dest)
 
     return str(dest)
+
+
+def verify_temp_library_signature():
+    """Verify that the loaded library is actually the temporary working library"""
+    return PhotosLibrary().album(TEMP_LIBRARY_SENTINEL_ALBUM) is not None
 
 
 def open_sqlite_db(fname: str):
@@ -78,32 +52,35 @@ def open_sqlite_db(fname: str):
 def resolve_cfdata_bookmark(bookmark: bytes) -> str:
     """Resolve a bookmark stored as a serialized CFData object into a path str"""
 
-    # use CFURLCreateByResolvingBookmarkData to de-serialize bookmark data into a CFURLRef
-    url = CoreFoundation.CFURLCreateByResolvingBookmarkData(
-        kCFAllocatorDefault, bookmark, 0, None, None, None, None
-    )
+    with objc.autorelease_pool():
+        # use CFURLCreateByResolvingBookmarkData to de-serialize bookmark data into a CFURLRef
+        url = CoreFoundation.CFURLCreateByResolvingBookmarkData(
+            kCFAllocatorDefault, bookmark, 0, None, None, None, None
+        )
 
-    # the CFURLRef we got is a sruct that python treats as an array
-    # I'd like to pass this to CFURLGetFileSystemRepresentation to get the path but
-    # CFURLGetFileSystemRepresentation barfs when it gets an array from python instead of expected struct
-    # first element is the path string in form:
-    # file:///Users/username/Pictures/Photos%20Library.photoslibrary/
-    urlstr = url[0].absoluteString() if url[0] else None
+        # the CFURLRef we got is a sruct that python treats as an array
+        # I'd like to pass this to CFURLGetFileSystemRepresentation to get the path but
+        # CFURLGetFileSystemRepresentation barfs when it gets an array from python instead of expected struct
+        # first element is the path string in form:
+        # file:///Users/username/Pictures/Photos%20Library.photoslibrary/
+        urlstr = url[0].absoluteString() if url[0] else None
 
-    # get detailed info about the bookmark for reverse engineering
-    # resources = CoreFoundation.CFURLCreateResourcePropertiesForKeysFromBookmarkData(
-    #     None,
-    #     ["NSURLBookmarkDetailedDescription"],
-    #     bookmark,
-    # )
-    # print(f"{resources['NSURLBookmarkDetailedDescription']}")
+        # get detailed info about the bookmark for reverse engineering
+        # resources = CoreFoundation.CFURLCreateResourcePropertiesForKeysFromBookmarkData(
+        #     None,
+        #     ["NSURLBookmarkDetailedDescription"],
+        #     bookmark,
+        # )
+        # print(f"{resources['NSURLBookmarkDetailedDescription']}")
 
-    # now coerce the file URI back into an OS path
-    # surely there must be a better way
-    if not urlstr:
-        raise ValueError("Could not resolve bookmark")
+        # now coerce the file URI back into an OS path
+        # surely there must be a better way
+        if not urlstr:
+            raise ValueError("Could not resolve bookmark")
 
-    return os.path.normpath(urllib.parse.unquote(urllib.parse.urlparse(urlstr).path))
+        return os.path.normpath(
+            urllib.parse.unquote(urllib.parse.urlparse(urlstr).path)
+        )
 
 
 def read_file_locations_from_photos_database(photos_db_path):
@@ -121,19 +98,18 @@ def read_file_locations_from_photos_database(photos_db_path):
         pk = row[0]
         pathstr = row[1]
         bookmark_data = row[2]
-        if bookmark_data:
-            try:
-                bookmark_path = resolve_cfdata_bookmark(bookmark_data)
-                referenced_files[pk] = bookmark_path
-                if _verbose > 1:
-                    click.secho(f"... will import path '{bookmark_path}'", fg="green")
-            except ValueError as e:
-                # if the file is missing, we can't resolve the bookmark
-                click.secho(
-                    f"Skipping missing file '{pathstr}', cannot resolve bookmarks for missing files.",
-                    err=True,
-                    fg="red",
-                )
+        try:
+            bookmark_path = resolve_cfdata_bookmark(bookmark_data)
+            referenced_files[pk] = bookmark_path
+            if _verbose > 1:
+                click.secho(f"... will import path '{bookmark_path}'", fg="green")
+        except ValueError as e:
+            # if the file is missing, we can't resolve the bookmark
+            click.secho(
+                f"Skipping missing file '{pathstr}', cannot resolve bookmarks for missing files.",
+                err=True,
+                fg="red",
+            )
     conn.close()
     return referenced_files
 
@@ -154,27 +130,18 @@ def read_bookmarks_from_photos_database(photos_db_path):
     )
     bookmarks = {}
     for row in c:
-        pk = row[0]
         pathstr = row[1]
         bookmark_data = row[2]
         if bookmark_data:
-            try:
-                bookmark_path = resolve_cfdata_bookmark(bookmark_data)
-                bookmarks[pathstr] = bookmark_data
-            except ValueError as e:
-                # if the file is missing, we can't resolve the bookmark
-                click.secho(
-                    f"Skipping missing file '{pathstr}', cannot read bookmarks for missing files.",
-                    err=True,
-                    fg="red",
-                )
+            bookmarks[pathstr] = bookmark_data
     conn.close()
     return bookmarks
+
 
 def check_if_pathstr_in_filesystem_bookmarks(c, pathstr):
     c.execute(
         "SELECT COUNT(*) FROM ZFILESYSTEMBOOKMARK WHERE ZPATHRELATIVETOVOLUME = ?",
-        (pathstr, )
+        (pathstr,),
     )
     for row in c:
         if row[0] == 0:
@@ -185,17 +152,14 @@ def check_if_pathstr_in_filesystem_bookmarks(c, pathstr):
             click.secho(
                 f"File '{pathstr}' has multiple entries in ZFILESYSTEMBOOKMARK table",
                 err=True,
-                fg="yellow")
+                fg="yellow",
+            )
             return True
 
+
 def get_pathstrs_in_filesystembookmarks(c):
-    pathstrs = set()
-    c.execute(
-        "SELECT ZPATHRELATIVETOVOLUME FROM ZFILESYSTEMBOOKMARK"
-    )
-    for row in c:
-        pathstrs.add(row[0])
-    return pathstrs
+    c.execute("SELECT ZPATHRELATIVETOVOLUME FROM ZFILESYSTEMBOOKMARK")
+    return {row[0] for row in c}
 
 
 def update_bookmarks_in_photos_database(photos_db_path, bookmarks):
@@ -208,32 +172,31 @@ def update_bookmarks_in_photos_database(photos_db_path, bookmarks):
         if _verbose > 0:
             click.secho(f"Updating bookmark for {pathstr}", fg="green")
         if check_if_pathstr_in_filesystem_bookmarks(c, pathstr) == False:
-            click.secho(f"File '{pathstr}' is not in ZFILESYSTEMBOOKMARK",
-                fg="red", err=True)
+            click.secho(
+                f"File '{pathstr}' is not in ZFILESYSTEMBOOKMARK", fg="red", err=True
+            )
         conn.execute(
             "UPDATE ZFILESYSTEMBOOKMARK SET ZBOOKMARKDATA = ? WHERE ZPATHRELATIVETOVOLUME = ?",
             (bytes(bookmark_data), pathstr),
-            )
+        )
         updated_pathstrs.add(pathstr)
     if _verbose > 0:
         missing = pathstrs.difference(updated_pathstrs)
         for pathstr in missing:
             click.secho(f"File '{pathstr}' was not updated", fg="yellow", err=True)
         if len(pathstrs) == 0:
-            click.secho(f"All files were updated", fg="green")
+            click.secho("All files were updated", fg="green")
     conn.commit()
     conn.close()
 
 
-
-
 @click.command()
 @click.argument("photos_library_path", type=click.Path(exists=True))
-@click.option('-v', '--verbose', count=True)
-@click.option('--debug-skip-import/--no-debug-skip-import', default=False)
+@click.option("-v", "--verbose", count=True)
+@click.option("--debug-skip-import/--no-debug-skip-import", default=False)
 def main(photos_library_path, verbose, debug_skip_import):
     """Repair photo bookmarks in a Photos sqlite database"""
-    global _verbose 
+    global _verbose
     _verbose = verbose
     print(_verbose)
     photos_db_path = pathlib.Path(photos_library_path) / "database/Photos.sqlite"
@@ -270,7 +233,13 @@ def main(photos_library_path, verbose, debug_skip_import):
         abort=True,
     )
 
-    # TODO: The template library should have a uniquely named album so we can confirm it's the one that's actually opened
+    if not verify_temp_library_signature():
+        click.secho(
+            "Temporary Photos library missing sentinel value. Are you sure you opened the right library?",
+            err=True,
+            fg="red",
+        )
+        raise click.Abort("foo")
 
     click.echo("Reading data for referenced files from target library")
     referenced_files = read_file_locations_from_photos_database(photos_db_path)
