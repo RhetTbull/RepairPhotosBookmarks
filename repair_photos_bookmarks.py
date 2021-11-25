@@ -330,7 +330,7 @@ def main(photos_library_path, verbose, debug_skip_import):
         "'Importing: Copy items to the Photos library'"
     )
     click.echo(
-        f"You may now delete the temporary Photos library by dragging it to the recycle bin in Finder: {temp_library_path}"
+        f"You may now delete the temporary Photos library by dragging it to the Trash in Finder: {temp_library_path}"
     )
     click.echo("Done.")
 
