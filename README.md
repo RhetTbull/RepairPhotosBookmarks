@@ -14,6 +14,10 @@ This is a work in progress and it's a bit of hack.  It requires a few manual ste
 - python3 repair_photos_bookmarks.py PATH_TO_PHOTOS_LIBRARY
 - follow the prompts
 
+## Contributors
+
+Thanks to [@dgleich](https://github.com/dgleich) for the idea behind this project and for contributing significant research, testing, and code!  This was a joint effort.
+
 ## Additional Information
 
 For more information, see this [discussion](https://github.com/RhetTbull/osxphotos/discussions/319)
