@@ -154,7 +154,7 @@ def read_bookmarks_from_photos_database(photos_db_path):
         if bookmark_data:
             try:
                 bookmark_path = resolve_cfdata_bookmark(bookmark_data)
-                bookmarks[bookmark_path] = bookmark_data
+                bookmarks[pathstr] = bookmark_data
             except ValueError as e:
                 # if the file is missing, we can't resolve the bookmark
                 click.secho(
