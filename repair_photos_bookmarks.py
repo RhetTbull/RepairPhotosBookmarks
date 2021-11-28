@@ -4,12 +4,13 @@ import os
 import pathlib
 import sqlite3
 import urllib
-import psutil
 
 import click
 import CoreFoundation
 import objc
+import psutil
 from Foundation import kCFAllocatorDefault
+from mac_alias import Bookmark, kBookmarkPath
 from photoscript import PhotosLibrary
 from photoscript.utils import ditto
 
@@ -53,6 +54,21 @@ def open_sqlite_db(fname: str):
     except sqlite3.Error as e:
         raise OSError(f"Error opening {fname}: {e}")
     return (conn, c)
+
+
+def resolve_bookmark_path(bookmark_data: bytes) -> str:
+    """Get the path from a CFURL file bookmark
+    This works without calling CFURLCreateByResolvingBookmarkData
+    which fails if the target file does not exist
+    """
+    try:
+        bookmark = Bookmark.from_bytes(bookmark_data)
+    except Exception as e:
+        raise ValueError(f"Invalid bookmark: {e}")
+    path_components = bookmark.get(kBookmarkPath, None)
+    if not path_components:
+        return None
+    return "/" + os.path.join(*path_components)
 
 
 def resolve_cfdata_bookmark(bookmark: bytes) -> str:
@@ -105,7 +121,7 @@ def read_file_locations_from_photos_database(photos_db_path):
         pathstr = row[1]
         bookmark_data = row[2]
         try:
-            bookmark_path = resolve_cfdata_bookmark(bookmark_data)
+            bookmark_path = resolve_bookmark_path(bookmark_data)
             referenced_files[pk] = bookmark_path
             if _verbose > 1:
                 click.secho(f"... will import path '{bookmark_path}'", fg="green")
@@ -280,6 +296,7 @@ def main(photos_library_path, verbose, debug_skip_import):
                 err=True,
                 fg="red",
             )
+            continue
         import_file_to_photos(filepath)
 
     click.confirm(
