@@ -12,12 +12,15 @@ import subprocess
 import sys
 import time
 from collections import namedtuple
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import click
 from mac_alias import Bookmark, kBookmarkPath
 from photoscript import PhotosLibrary
 from photoscript.utils import ditto
+
+# TODO: check the import group logic
 
 _verbose = 0
 
@@ -75,6 +78,7 @@ def photos_is_running() -> bool:
     )
 
 
+@lru_cache
 def get_volume_uuid(path: str) -> str:
     """Returns the volume UUID for the given path or None if not found"""
     try:
@@ -259,8 +263,9 @@ def get_previously_imported_filepaths(photos_db_path):
     return allpaths
 
 
-# from https://stackoverflow.com/questions/8991506/iterate-an-iterator-by-chunks-of-n-in-python
-def grouper_it(n, iterable):
+def chunk_iterator_by_n(n, iterable):
+    """Yield successive n-sized chunks from iterable."""
+    # reference: https://stackoverflow.com/questions/8991506/iterate-an-iterator-by-chunks-of-n-in-python
     it = iter(iterable)
     while True:
         chunk_it = itertools.islice(it, n)
@@ -457,7 +462,7 @@ def main(
 
     ntried = 0
     click.echo("Importing photos into temporary working library")
-    for filepath_groups in grouper_it(groupsize, import_groups):
+    for filepath_groups in chunk_iterator_by_n(groupsize, import_groups):
         filepaths = [fp for fplist in filepath_groups for fp in fplist]
 
         to_import = []
