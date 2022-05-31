@@ -1,4 +1,7 @@
-"""Repair 'Missing File' errors in Photos caused by moving referenced files to a different drive"""
+"""Repair 'Missing File' errors in Photos caused by moving referenced files to a different drive
+
+Thanks to David Gleich (@dgleich, https://github.com/dgleich) who contributed key portions of the code.
+"""
 
 import itertools
 import os
@@ -8,12 +11,10 @@ import sqlite3
 import subprocess
 import sys
 import time
-import urllib
+from collections import namedtuple
+from typing import Dict, List, Optional, Tuple
 
 import click
-import CoreFoundation
-import objc
-from Foundation import kCFAllocatorDefault
 from mac_alias import Bookmark, kBookmarkPath
 from photoscript import PhotosLibrary
 from photoscript.utils import ditto
@@ -28,8 +29,14 @@ TEMP_LIBRARY_SENTINEL_ALBUM = "ZZZ_OSXPHOTOS_SENTINEL_ZZZ"
 SLEEP_TIME_AFTER_QUIT = 5
 SLEEP_TIME_AFTER_ACTIVATE = 10
 
+ZFileSystemBookmarkRecord = namedtuple(
+    "ZFileSystemBookmarkRecord",
+    ["pk", "volume_name", "volume_uuid", "path_relative_to_volume", "bookmark_data"],
+)
+
 
 def get_temp_photos_library_dir():
+    """Get the path to the temporary photos library"""
     # is picture folder always here independent of locale or language?
     picture_folder = pathlib.Path("~/Pictures").expanduser()
     if not picture_folder.is_dir():
@@ -39,7 +46,7 @@ def get_temp_photos_library_dir():
 
 
 def copy_temporary_photos_library():
-    """copy the template library and open Photos, returns path to copied library"""
+    """Copy the template library and open Photos, returns path to copied library"""
     src = pathlib.Path(TEMPLATE_DIRECTORY) / TEMPLATE_LIBRARY
 
     dest = get_temp_photos_library_dir()
@@ -55,7 +62,7 @@ def verify_temp_library_signature():
 
 def photos_is_running() -> bool:
     """Returns True if current user is running Photos, otherwise False"""
-    # Note: use subprocess because psutil doesn't work on M1 (see #3)
+    # Note: use subprocess because psutil doesn't work on M1 Macs (see #3)
     user_name = subprocess.check_output(["id", "-un"]).decode("utf-8").strip()
     output = (
         subprocess.check_output(["ps", "-ax", "-o", "user", "-o", "command"])
@@ -88,6 +95,24 @@ def open_sqlite_db(fname: str):
     return (conn, c)
 
 
+def get_path_from_zfilesystembookmark_record(record: ZFileSystemBookmarkRecord) -> str:
+    """Get path from a ZFILESYSTEMBOOKMARK record, either by resolving the bookmark or trying to reconstruct the path"""
+    if bookmark_data := record.bookmark_data:
+        return resolve_bookmark_path(bookmark_data)
+
+    # if we don't have a bookmark, we can reconstruct the path
+    # don't add the mount point if it's on the root volume
+    # e.g. Photos expects paths on root volumes to be in form
+    # /Users/username/Pictures/img_1234.jpg
+    # not
+    # /Volumes/Macintosh HD/Users/username/Pictures/img_1234.jpg
+    return (
+        f"/{record.path_relative_to_volume}"
+        if get_volume_uuid(f"/Volumes/{record.volume_name}") == get_volume_uuid("/")
+        else f"/Volumes/{record.volume_name}/{record.path_relative_to_volume}"
+    )
+
+
 def resolve_bookmark_path(bookmark_data: bytes) -> str:
     """Get the path from a CFURL file bookmark
     This works without calling CFURLCreateByResolvingBookmarkData
@@ -103,59 +128,21 @@ def resolve_bookmark_path(bookmark_data: bytes) -> str:
     return f"/{os.path.join(*path_components)}"
 
 
-# TODO Remove this in the future as it's slower and not used!
-def _resolve_cfdata_bookmark(bookmark: bytes) -> str:
-    """Resolve a bookmark stored as a serialized CFData object into a path str"""
-
-    with objc.autorelease_pool():
-        # use CFURLCreateByResolvingBookmarkData to de-serialize bookmark data into a CFURLRef
-        url = CoreFoundation.CFURLCreateByResolvingBookmarkData(
-            kCFAllocatorDefault, bookmark, 0, None, None, None, None
-        )
-
-        # the CFURLRef we got is a struct that python treats as an array
-        # I'd like to pass this to CFURLGetFileSystemRepresentation to get the path but
-        # CFURLGetFileSystemRepresentation barfs when it gets an array from python instead of expected struct
-        # first element is the path string in form:
-        # file:///Users/username/Pictures/Photos%20Library.photoslibrary/
-        urlstr = url[0].absoluteString() if url[0] else None
-
-        # get detailed info about the bookmark for reverse engineering
-        # resources = CoreFoundation.CFURLCreateResourcePropertiesForKeysFromBookmarkData(
-        #     None,
-        #     ["NSURLBookmarkDetailedDescription"],
-        #     bookmark,
-        # )
-        # print(f"{resources['NSURLBookmarkDetailedDescription']}")
-
-        # now coerce the file URI back into an OS path
-        # surely there must be a better way
-        if not urlstr:
-            raise ValueError("Could not resolve bookmark")
-
-        return os.path.normpath(
-            urllib.parse.unquote(urllib.parse.urlparse(urlstr).path)
-        )
-
-
-def read_file_locations_from_photos_database(photos_db_path):
-    """read locations for referenced files from Photos database, returns dict of file paths by pk"""
-    results = _read_zfilesystem_bookmark_from_photos_database(photos_db_path)
-
-    # read all the bookmarks
-    # TODO: Do we really need to resolve the bookmarks or can we construct the path from the ZFILESYSTEMBOOKMARK.ZPATHRELATIVETOVOLUME and ZFILESYSTEMVOLUME.ZNAME fields?
-    # Note, it's best / simplest to resolve the bookmarks, although the other info could be a backup
+def read_file_locations_from_photos_database(photos_db_path: str) -> Dict:
+    """Read locations for referenced files from Photos database, returns dict of file paths by pk"""
     referenced_files = {}
-    for pk, pathstr, bookmark_data in results:
+    results = read_zfilesystembookmark_from_photos_database(photos_db_path)
+    for result in results:
         try:
-            bookmark_path = resolve_bookmark_path(bookmark_data)
-            referenced_files[pk] = bookmark_path
+            bookmark_path = get_path_from_zfilesystembookmark_record(result)
+            referenced_files[result.pk] = bookmark_path
             if _verbose > 2:
                 click.secho(f"... will import path '{bookmark_path}'", fg="green")
         except ValueError as e:
             # if the file is missing, we can't resolve the bookmark
+            # TODO: need to change the logic here now that get_path_from_zfilesystembookmark_record will attempt to reconstruct the path
             click.secho(
-                f"Skipping missing file '{pathstr}', cannot resolve bookmarks for missing files.",
+                f"Skipping missing file '{result.path_relative_to_volume}', cannot resolve bookmarks for missing files.",
                 err=True,
                 fg="red",
             )
@@ -177,35 +164,55 @@ def import_files_to_photos(filepaths):
     pl.import_photos(list(filepaths), skip_duplicate_check=True)
 
 
-def _read_zfilesystem_bookmark_from_photos_database(
-    photos_db_path, *, filter_null_bookmark_data=True
-):
+def read_zfilesystembookmark_from_photos_database(
+    photos_db_path: str,
+) -> List[ZFileSystemBookmarkRecord]:
     """Dump the main useful contents of the ZFILESYSTEMBOOKMARK table.
-    filter_null_bookmark_data is True by default, which skips records where zbookmarkdata is null.
-    This returns a list of tuples, with primarykey, pathrel, and bookmarkdata.
+    This returns a namedtuple with keys of: pk, volume_name, volume_uuid, path_relative_to_volume, and bookmark_data
     """
-    (conn, c) = open_sqlite_db(photos_db_path)
+    conn, c = open_sqlite_db(photos_db_path)
     c.execute(
-        "SELECT Z_PK, ZPATHRELATIVETOVOLUME, ZBOOKMARKDATA FROM ZFILESYSTEMBOOKMARK"
+        """ SELECT
+            ZFILESYSTEMBOOKMARK.Z_PK, 
+            ZFILESYSTEMVOLUME.ZNAME, 
+            ZFILESYSTEMVOLUME.ZVOLUMEUUIDSTRING, 
+            ZFILESYSTEMBOOKMARK.ZPATHRELATIVETOVOLUME, 
+            ZFILESYSTEMBOOKMARK.ZBOOKMARKDATA
+        FROM ZFILESYSTEMBOOKMARK
+        JOIN ZINTERNALRESOURCE ON ZINTERNALRESOURCE.ZFILESYSTEMBOOKMARK = ZFILESYSTEMBOOKMARK.Z_PK
+        JOIN ZFILESYSTEMVOLUME ON ZFILESYSTEMVOLUME.Z_PK = ZINTERNALRESOURCE.ZFILESYSTEMVOLUME
+    """
     )
     results = []
     for row in c:
         pk = row[0]
-        pathstr = row[1]
-        bookmark_data = row[2]
-        if bookmark_data or filter_null_bookmark_data is False:
-            results.append((pk, pathstr, bookmark_data))
+        volume_name = row[1]
+        volume_uuid = row[2]
+        pathstr = row[3]
+        bookmark_data = row[4]
+        results.append(
+            ZFileSystemBookmarkRecord(
+                pk, volume_name, volume_uuid, pathstr, bookmark_data
+            )
+        )
     conn.close()
     return results
 
 
-def _get_bookmark_data_by_path(db_path):
-    results = _read_zfilesystem_bookmark_from_photos_database(db_path)
+def get_bookmark_data_by_path(db_path) -> Dict:
+    """Returns a dict of bookmark data by path"""
+    results = read_zfilesystembookmark_from_photos_database(db_path)
     bookmarks_by_path = {}
-    for pk, pathstr, bookmarkdata in results:
+    for result in results:
         # resolve the bookmark data
-        filepath = resolve_bookmark_path(bookmarkdata)
-        bookmarks_by_path[filepath] = bookmarkdata
+        bookmark_data = result.bookmark_data
+        if bookmark_data:
+            filepath = resolve_bookmark_path(bookmark_data)
+        else:
+            # if bookmark data is missing, try to reconstruct the path
+            filepath = f"{result.volume_name}/{result.path_relative_to_volume}"
+        if filepath:
+            bookmarks_by_path[filepath] = bookmark_data
     return bookmarks_by_path
 
 
@@ -213,7 +220,7 @@ def update_bookmarks_in_photos_database(
     referenced_files, photos_db_path, import_db_path
 ):
     """Update bookmarks for referenced files in a Photos library database"""
-    new_bookmarks = _get_bookmark_data_by_path(import_db_path)
+    new_bookmarks = get_bookmark_data_by_path(import_db_path)
     # update each bookmark in the database
     (conn, c) = open_sqlite_db(photos_db_path)
     updated_paths = set()
@@ -244,10 +251,10 @@ def update_bookmarks_in_photos_database(
 
 
 def get_previously_imported_filepaths(photos_db_path):
-    results = _read_zfilesystem_bookmark_from_photos_database(photos_db_path)
+    results = read_zfilesystembookmark_from_photos_database(photos_db_path)
     allpaths = set()
-    for pk, pathstr, bookmark_data in results:
-        fullpath = resolve_bookmark_path(bookmark_data)
+    for result in results:
+        fullpath = get_path_from_zfilesystembookmark_record(result)
         allpaths.add(fullpath)
     return allpaths
 
@@ -283,7 +290,7 @@ def group_filepaths(filepaths):
     return [list(g) for k, g in itertools.groupby(gsorted, keyfunc)]
 
 
-def _already_all_imported(group, imported_filepaths):
+def already_all_imported(group, imported_filepaths):
     """Test is all the filepaths in groups are already imported in
     imported_filepaths"""
     nimported = sum(fp in imported_filepaths for fp in group)
@@ -293,14 +300,16 @@ def _already_all_imported(group, imported_filepaths):
 def make_import_groups(filepaths, imported_filepaths):
     """Group files and find all the groups where at least one file isn't imported."""
     groups = group_filepaths(filepaths)
-    check_group = lambda group: not _already_all_imported(group, imported_filepaths)
+    check_group = lambda group: not already_all_imported(group, imported_filepaths)
     return filter(check_group, groups)
 
 
-def move_aae_file_if_it_exists(filepath, do_not_move_set=None):
+def move_aae_file_if_it_exists(
+    filepath: str, do_not_move_set: bool = None
+) -> Optional[Tuple[str, str]]:
     """Check if an AAE file exists for this file path, if so, we move it to an AAE.bak file,
-    And return the pair of original AAE file path and moved file path. If the AAE file does not
-    Exist, we return None."""
+    and return the pair of original AAE file path and moved file path. If the AAE file does not
+    exist, return None"""
 
     # check upper and lowercase aae extensions
     # make sure file path exists
@@ -355,8 +364,7 @@ def main(
     _verbose = verbose
 
     if _verbose:
-        print(f"Verbose mode is on, level={_verbose}")
-    if _verbose:
+        click.echo(f"Verbose mode is on, level={_verbose}")
         click.echo(f"  restart = {restart}")
         click.echo(f"  groupsize = {groupsize}")
         click.echo(f"  photos_library_path = {photos_library_path}")
