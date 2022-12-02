@@ -194,7 +194,7 @@ def update_bookmarks_in_photos_database(referenced_files, photos_db_path, import
             click.secho(f"Updating bookmark for {filepath} with primary key = {pk}", fg="green")
         if filepath not in new_bookmarks:
             click.secho(
-                f"File '{pathstr}' is not in ZFILESYSTEMBOOKMARK", fg="red", err=True
+                f"File '{filepath}' is not in ZFILESYSTEMBOOKMARK", fg="red", err=True
             )
         else:
             bookmark_data = new_bookmarks[filepath]
