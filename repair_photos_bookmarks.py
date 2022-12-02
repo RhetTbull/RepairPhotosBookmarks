@@ -73,7 +73,7 @@ def photos_is_running() -> bool:
         .splitlines()
     )
     return any(
-        proc[0] == user_name and "Photos.app" in proc[1]
+        proc[0] == user_name and "/Photos.app/" in proc[1]
         for proc in [line.split(" ", 1) for line in output]
     )
 
