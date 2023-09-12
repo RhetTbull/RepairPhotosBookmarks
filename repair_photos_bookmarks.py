@@ -3,6 +3,9 @@
 Thanks to David Gleich (@dgleich, https://github.com/dgleich) who contributed key portions of the code.
 """
 
+from __future__ import annotations
+
+import subprocess
 import itertools
 import os
 import pathlib
@@ -11,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from collections import namedtuple
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
@@ -18,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 import click
 from mac_alias import Bookmark, kBookmarkPath
 from photoscript import PhotosLibrary
-from photoscript.utils import ditto
+import photokit
 
 # TODO: check the import group logic
 
@@ -29,38 +33,38 @@ TEMPLATE_LIBRARY = "osxphotos_temporary_working_library.photoslibrary"
 TEMP_LIBRARY_SENTINEL_ALBUM = "ZZZ_OSXPHOTOS_SENTINEL_ZZZ"
 
 # seconds to sleep after quitting/activating Photos
+# gives Photos time to shutdown or activate before hitting it with more AppleScript commands
 SLEEP_TIME_AFTER_QUIT = 5
 SLEEP_TIME_AFTER_ACTIVATE = 10
 
+# seconds to sleep after importing a group of files
+# gives Photos time to process the import and AppleScript time to not choke
+SLEEP_TIME_AFTER_IMPORT = 0.25
+
+# namedtuple to hold the data from the ZFILESYSTEMBOOKMARK table
 ZFileSystemBookmarkRecord = namedtuple(
     "ZFileSystemBookmarkRecord",
     ["pk", "volume_name", "volume_uuid", "path_relative_to_volume", "bookmark_data"],
 )
 
 
-def get_temp_photos_library_dir():
-    """Get the path to the temporary photos library"""
+def get_temp_photos_library_dir() -> pathlib.Path:
+    """Get the path to the hold temporary photos library"""
     # is picture folder always here independent of locale or language?
     picture_folder = pathlib.Path("~/Pictures").expanduser()
     if not picture_folder.is_dir():
         raise FileNotFoundError(f"Invalid picture folder: '{picture_folder}'")
 
-    return picture_folder / TEMPLATE_LIBRARY
+    return picture_folder
 
 
-def copy_temporary_photos_library():
-    """Copy the template library and open Photos, returns path to copied library"""
-    src = pathlib.Path(TEMPLATE_DIRECTORY) / TEMPLATE_LIBRARY
-
+def create_or_get_temporary_photos_library():
+    """Return path to temporary Photos library, creating it if needed"""
     dest = get_temp_photos_library_dir()
-    ditto(src, dest)
-    return str(dest)
-
-
-def verify_temp_library_signature():
-    """Verify that the loaded library is actually the temporary working library"""
-    # return PhotosLibrary().album(TEMP_LIBRARY_SENTINEL_ALBUM) is not None
-    return PhotosLibrary().album(TEMP_LIBRARY_SENTINEL_ALBUM) is not None
+    temp_library_path = dest / TEMPLATE_LIBRARY
+    if not temp_library_path.exists():
+        photokit.PhotoLibrary.create_library(str(temp_library_path))
+    return temp_library_path
 
 
 def photos_is_running() -> bool:
@@ -89,7 +93,7 @@ def get_volume_uuid(path: str) -> str:
         return None
 
 
-def open_sqlite_db(fname: str):
+def open_sqlite_db(fname: str) -> tuple[sqlite3.Connection, sqlite3.Cursor]:
     """Open sqlite database and return connection to the database"""
     try:
         conn = sqlite3.connect(f"{fname}")
@@ -162,7 +166,7 @@ def import_files_to_photos(filepaths):
     """import a file into Photos"""
     pl = PhotosLibrary()
     if _verbose > 2:
-        click.secho("... doing import of ", fg="green")
+        click.secho(f"... doing import of ", fg="green")
         for filepath in filepaths:
             click.secho(f"... -- '{filepath}' ", fg="green")
     pl.import_photos(list(filepaths), skip_duplicate_check=True)
@@ -263,7 +267,7 @@ def get_previously_imported_filepaths(photos_db_path):
     return allpaths
 
 
-def chunk_iterator_by_n(n, iterable):
+def chunk_iterable(n, iterable):
     """Yield successive n-sized chunks from iterable."""
     # reference: https://stackoverflow.com/questions/8991506/iterate-an-iterator-by-chunks-of-n-in-python
     it = iter(iterable)
@@ -341,30 +345,168 @@ def move_aae_file_if_it_exists(
 
 
 def move_aae_files_back(moved_aae):
-    for (original_file, moved_file) in moved_aae:
+    for original_file, moved_file in moved_aae:
         if _verbose > 0:
             click.secho(f"... moving {moved_file} back to {original_file}", fg="green")
         os.rename(moved_file, original_file)
 
 
+def verify_and_fix_zfilesystemvolume_data(photos_db_path: str):
+    """Verify that references to volume name and UUID are updated after fixing bookmarks"""
+    conn, c = open_sqlite_db(photos_db_path)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()  # need to get cursor again to use row_factory
+
+    # look at all the foreign keys in ZINTERNALRESOURCE to verify the volume UUID is correct
+    c.execute(
+        """ SELECT Z_PK, ZFILESYSTEMBOOKMARK, ZFILESYSTEMVOLUME
+            FROM ZINTERNALRESOURCE
+            WHERE ZFILESYSTEMVOLUME IS NOT NULL OR ZFILESYSTEMBOOKMARK IS NOT NULL
+        """
+    )
+    for row in c.fetchall():
+        if row["ZFILESYSTEMVOLUME"] is not None:
+            volume_id = row["ZFILESYSTEMVOLUME"]
+            volume_data = read_zfilesystemvolume_data(photos_db_path)
+            if volume_id not in volume_data:
+                click.secho(
+                    f"ZFILESYSTEMVOLUME {volume_id} not found in ZFILESYSTEMVOLUME table",
+                    fg="red",
+                    err=True,
+                )
+                continue
+            volume = volume_data[volume_id]
+            actual_volume_uuid = get_volume_uuid("/Volumes/" + volume["ZNAME"])
+            if volume["ZVOLUMEUUIDSTRING"] != actual_volume_uuid:
+                if _verbose > 2:
+                    click.secho(
+                        f"Updating File System Volume UUID for {volume['ZNAME']} from {volume['ZVOLUMEUUIDSTRING']} to {actual_volume_uuid}"
+                    )
+                set_volume_info_for_zinternalresource(
+                    photos_db_path,
+                    row["Z_PK"],
+                    volume["ZNAME"],
+                    actual_volume_uuid,
+                )
+
+
+def set_volume_info_for_zinternalresource(
+    photos_db_path: str, internal_resource_pk: int, volume_name: str, volume_uuid: str
+) -> int:
+    """Set the volume info in the Photos database for a record in ZINTERNALRESOURCE, creating a new ZFILESYSTEMVOLUME record if needed"""
+    volume_data = read_zfilesystemvolume_data(photos_db_path)
+    conn, c = open_sqlite_db(photos_db_path)
+    for volume in volume_data.values():
+        if (
+            volume_name == volume["ZNAME"]
+            and volume_uuid == volume["ZVOLUMEUUIDSTRING"]
+        ):
+            # found the volume, update the uuid
+            c.execute(
+                "UPDATE ZINTERNALRESOURCE SET ZFILESYSTEMVOLUME = ? WHERE Z_PK = ?",
+                (volume["Z_PK"], internal_resource_pk),
+            )
+            conn.commit()
+            return volume["Z_PK"]
+    # didn't find the volume, create a new one
+    new_uuid = str(uuid.uuid4()).upper()
+    z_ent = get_entity_id_from_photos_database(photos_db_path, "FileSystemVolume")
+    z_opt = 1
+    c.execute(
+        "INSERT INTO ZFILESYSTEMVOLUME (Z_ENT, Z_OPT, ZNAME, ZUUID, ZVOLUMEUUIDSTRING) VALUES (?, ?, ?, ?, ?)",
+        (z_ent, z_opt, volume_name, new_uuid, volume_uuid),
+    )
+    rowid = c.lastrowid
+    c.execute(
+        "UPDATE ZINTERNALRESOURCE SET ZFILESYSTEMVOLUME = ? WHERE Z_PK = ?",
+        (rowid, internal_resource_pk),
+    )
+
+    # Increment the Z_MAX column of Z_PRIMARYKEY since we added a row to ZFILESYSTEMVOLUME
+    c.execute(
+        "UPDATE Z_PRIMARYKEY SET Z_MAX = Z_MAX + 1 WHERE Z_NAME = ?",
+        ("FileSystemVolume",),
+    )
+    conn.commit()
+
+    return rowid
+
+
+@lru_cache
+def get_entity_id_from_photos_database(photos_db_path: str, entity: str) -> int:
+    """Get the associated Z_ENT entity ID from the Z_PRIMARYKEY table for entity"""
+    conn, c = open_sqlite_db(photos_db_path)
+    results = c.execute(
+        "SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = ?", (entity,)
+    ).fetchone()
+    if results is None:
+        raise ValueError(f"Could not find entity {entity} in Z_PRIMARYKEY table")
+    return results[0]
+
+
+def read_zfilesystemvolume_data(photos_db_path: str) -> Dict[int, sqlite3.Row]:
+    """Return contents of ZFILESYSTEMVOLUME table as a dict of sqlite3.Row objects"""
+    conn, c = open_sqlite_db(photos_db_path)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()  # need to get cursor again to use row_factory
+    c.execute("SELECT Z_PK, ZNAME, ZUUID, ZVOLUMEUUIDSTRING FROM ZFILESYSTEMVOLUME")
+    return {row["Z_PK"]: row for row in c.fetchall()}
+
+
+def volume_uuid_from_path(path: str) -> str:
+    """Return the volume UUID for the given path"""
+    if not path.startswith("/Volumes/"):
+        return get_volume_uuid("/")
+    path_parts = os.path.split(path)
+    if len(path_parts < 2):
+        raise ValueError(f"Path '{path}' is not a valid volume path")
+    volume = os.path.join(path_parts[0], path_parts[1])
+    return get_volume_uuid(volume)
+
+
 @click.command()
-@click.argument("photos_library_path", type=click.Path(exists=True))
 @click.option("-v", "--verbose", count=True)
-@click.option("--restart", default=False)
-@click.option("--groupsize", default=5)
-@click.option("--move-aae", default=True)
-@click.option("--max-imports", default=10000)
+@click.option(
+    "--restart",
+    is_flag=True,
+    help="Restart a repair process from beginning. "
+    "If not specified, will resume from last known state.",
+)
+@click.option(
+    "--groupsize",
+    default=5,
+    help="Number of files to import at a time into temporary library. Default is 5.",
+)
+@click.option(
+    "--move-aae",
+    default=True,
+    help="Move AAE files to .bak files during repair. "
+    "AAE files contain information about edits made to photos and they can cause the repair process to not work correctly. "
+    "If you are not sure, you should leave this on. "
+    "Specify 0 to turn this feature off or 1 to turn it on. Default is 1 (on).",
+)
+@click.option(
+    "--max-imports",
+    default=10000,
+    help="Maximum number of files to import/process before quitting. Default is 10000.",
+)
 @click.option("--imports-before-pausing", default=250)
+@click.argument(
+    "photos_library_path", metavar="PHOTOS_LIBRARY_PATH", type=click.Path(exists=True)
+)
 def main(
-    photos_library_path,
-    verbose,
-    restart,
     groupsize,
-    move_aae,
-    max_imports,
     imports_before_pausing,
+    max_imports,
+    move_aae,
+    photos_library_path,
+    restart,
+    verbose,
 ):
-    """Repair photo bookmarks in a Photos sqlite database"""
+    """Repair photo bookmarks in a Photos database.
+
+    TODO: Add text here explaining what this does and why you might need it.
+    """
     global _verbose
     _verbose = verbose
 
@@ -390,7 +532,7 @@ def main(
     )
 
     click.confirm(
-        "Please open Photos and uncheck the box 'Importing: Copy items to the Photos library' in Photos Preferences.\n"
+        "Please open Photos and uncheck the box 'Importing: Copy items to the Photos library' in Photos Preferences/Settings.\n"
         "Type 'y' when you have done this.",
         abort=True,
     )
@@ -400,19 +542,19 @@ def main(
         abort=True,
     )
 
-    while photos_is_running() and restart == False:
+    while photos_is_running() and not restart:
         click.secho("Photos is still running, please quit it", fg="red", err=True)
         click.confirm(
             "Please quit Photos.\n" "Type 'y' when you have done this.",
             abort=True,
         )
 
-    if restart == False:
+    if not restart:
         click.echo("Creating a temporary working Photos library.")
-        temp_library_path = copy_temporary_photos_library()
-        click.echo(f"Created temporary Photos library at: {temp_library_path}")
+        temp_library_path = create_or_get_temporary_photos_library()
+        click.echo(f"Temporary Photos library at: {temp_library_path}")
     else:
-        temp_library_path = str(get_temp_photos_library_dir())
+        temp_library_path = str(get_temp_photos_library_dir() / TEMPLATE_LIBRARY)
 
     click.confirm(
         "Please open Photos while holding down the Option key then select the temporary working library.\n"
@@ -428,18 +570,18 @@ def main(
             abort=True,
         )
 
-    while not verify_temp_library_signature():
-        click.secho(
-            "Photos library missing sentinel value--does not appear to be temporary library. "
-            "Are you sure you opened the right library?",
-            err=True,
-            fg="red",
-        )
-        click.confirm(
-            "Please open Photos while holding down the Option key then select the temporary working library.\n"
-            "Type 'y' when you have done this.",
-            abort=True,
-        )
+    # while not verify_temp_library_signature():
+    #     click.secho(
+    #         "Photos library missing sentinel value--does not appear to be temporary library. "
+    #         "Are you sure you opened the right library?",
+    #         err=True,
+    #         fg="red",
+    #     )
+    #     click.confirm(
+    #         "Please open Photos while holding down the Option key then select the temporary working library.\n"
+    #         "Type 'y' when you have done this.",
+    #         abort=True,
+    #     )
 
     click.echo("Reading data for referenced files from target library")
     referenced_files = read_file_locations_from_photos_database(photos_db_path)
@@ -448,8 +590,15 @@ def main(
     # the first time it is run.
     temp_db_path = pathlib.Path(temp_library_path) / "database/Photos.sqlite"
     imported_bookmarks = get_previously_imported_filepaths(temp_db_path)
-    if restart == False:
-        assert len(imported_bookmarks) == 0
+    if not restart and len(imported_bookmarks):
+        click.secho(
+            f"There are previously imported bookmarks in the temporary photos library "
+            "but you did not use --restart.\n"
+            "If you intend to restart an import, use --restart or delete the temporary photos library at:\n"
+            f"{temp_library_path}",
+            fg="red",
+        )
+        raise click.Abort("Temporary library is not empty but --restart not specified")
     else:
         click.echo(
             f"Found '{len(imported_bookmarks)}' already imported from previous run"
@@ -462,7 +611,7 @@ def main(
 
     ntried = 0
     click.echo("Importing photos into temporary working library")
-    for filepath_groups in chunk_iterator_by_n(groupsize, import_groups):
+    for filepath_groups in chunk_iterable(groupsize, import_groups):
         filepaths = [fp for fplist in filepath_groups for fp in fplist]
 
         to_import = []
@@ -493,7 +642,7 @@ def main(
 
         if to_import:
             import_files_to_photos(to_import)
-            time.sleep(0.25)
+            time.sleep(SLEEP_TIME_AFTER_IMPORT)
             ntried += 1
             if moved_aae:
                 move_aae_files_back(moved_aae)
@@ -501,13 +650,13 @@ def main(
                 click.echo(
                     f"Pausing after {imports_before_pausing} imports (total imports = {ntried})"
                 )
-                pl = PhotosLibrary()
-                pl.quit()
+                # pl = PhotosLibrary()
+                # pl.quit()
                 time.sleep(SLEEP_TIME_AFTER_QUIT)
-                pl.activate()
-                time.sleep(SLEEP_TIME_AFTER_ACTIVATE)
+                # pl.activate()
+                # time.sleep(SLEEP_TIME_AFTER_ACTIVATE)
             if ntried >= max_imports:
-                click.echo("Stopping after {max_imports} imports")
+                click.echo(f"Stopping after {max_imports} imports")
                 sys.exit(1)
 
     click.confirm(
@@ -524,6 +673,9 @@ def main(
     click.echo("Rewriting bookmarks in target library")
     update_bookmarks_in_photos_database(referenced_files, photos_db_path, temp_db_path)
 
+    click.echo("Updating file system volume data in target library")
+    verify_and_fix_zfilesystemvolume_data(photos_db_path)
+
     click.confirm(
         f"Please open Photos while holding down the Option key then select your target library: {photos_library_path}\n"
         "Type 'y' when you have done this.",
@@ -538,24 +690,25 @@ def main(
             abort=True,
         )
 
-    while verify_temp_library_signature():
-        click.secho(
-            "It appears the temporary Photos library is still open. Are you sure you opened the right library?",
-            err=True,
-            fg="red",
-        )
-        click.confirm(
-            f"Please open Photos while holding down the Option key then select your target library: {photos_library_path}\n"
-            "Type 'y' when you have done this.",
-            abort=True,
-        )
+    # while verify_temp_library_signature():
+    #     click.secho(
+    #         "It appears the temporary Photos library is still open. Are you sure you opened the right library?",
+    #         err=True,
+    #         fg="red",
+    #     )
+    #     click.confirm(
+    #         f"Please open Photos while holding down the Option key then select your target library: {photos_library_path}\n"
+    #         "Type 'y' when you have done this.",
+    #         abort=True,
+    #     )
 
     click.echo(
         "If you want newly imported files copied into the Photos library, be sure to check the following box in Photos preferences:\n"
         "'Importing: Copy items to the Photos library'"
     )
     click.echo(
-        f"You may now delete the temporary Photos library by dragging it to the Trash in Finder: {temp_library_path}"
+        "You may now delete the temporary Photos library by dragging it to the Trash in Finder:\n"
+        f"{temp_library_path}"
     )
     click.echo("Done.")
 
