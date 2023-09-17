@@ -5,7 +5,6 @@ Thanks to David Gleich (@dgleich, https://github.com/dgleich) who contributed ke
 
 from __future__ import annotations
 
-import subprocess
 import itertools
 import os
 import pathlib
@@ -20,17 +19,17 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import click
+import photokit
 from mac_alias import Bookmark, kBookmarkPath
 from photoscript import PhotosLibrary
-import photokit
 
 # TODO: check the import group logic
 
 _verbose = 0
 
 TEMPLATE_DIRECTORY = "template_libraries"
-TEMPLATE_LIBRARY = "osxphotos_temporary_working_library.photoslibrary"
-TEMP_LIBRARY_SENTINEL_ALBUM = "ZZZ_OSXPHOTOS_SENTINEL_ZZZ"
+TEMPLATE_LIBRARY = "osxphotos_temporary_working_library"
+TEMP_LIBRARY_SENTINEL_ALBUM = "XYZZY_OSXPHOTOS_SENTINEL_XYZZY"
 
 # seconds to sleep after quitting/activating Photos
 # gives Photos time to shutdown or activate before hitting it with more AppleScript commands
@@ -61,9 +60,18 @@ def get_temp_photos_library_dir() -> pathlib.Path:
 def create_or_get_temporary_photos_library():
     """Return path to temporary Photos library, creating it if needed"""
     dest = get_temp_photos_library_dir()
-    temp_library_path = dest / TEMPLATE_LIBRARY
+
+    if library := list(dest.glob(f"{TEMPLATE_LIBRARY}*")):
+        # found a library, use it
+        return library[0]
+
+    # add timestamp to library name to avoid name collisions
+    # create_library() will fail if library has been recently created with same name
+    timestamp = time.perf_counter_ns()
+    temp_library_path = dest / f"{TEMPLATE_LIBRARY}_{timestamp}.photoslibrary"
     if not temp_library_path.exists():
-        photokit.PhotoLibrary.create_library(str(temp_library_path))
+        pl = photokit.PhotoLibrary.create_library(str(temp_library_path))
+        pl.create_album(TEMP_LIBRARY_SENTINEL_ALBUM)
     return temp_library_path
 
 
@@ -221,6 +229,8 @@ def get_bookmark_data_by_path(db_path) -> Dict:
             filepath = f"{result.volume_name}/{result.path_relative_to_volume}"
         if filepath:
             bookmarks_by_path[filepath] = bookmark_data
+        else:
+            click.secho(f"Could not resolve bookmark for {result}", fg="red", err=True)
     return bookmarks_by_path
 
 
@@ -464,6 +474,12 @@ def volume_uuid_from_path(path: str) -> str:
     return get_volume_uuid(volume)
 
 
+def verify_temp_library_signature():
+    """Verify that the opened library is actually the temporary working library"""
+    photoslib = PhotosLibrary()
+    return photoslib.album(TEMP_LIBRARY_SENTINEL_ALBUM) is not None
+
+
 @click.command()
 @click.option("-v", "--verbose", count=True)
 @click.option(
@@ -551,10 +567,8 @@ def main(
 
     if not restart:
         click.echo("Creating a temporary working Photos library.")
-        temp_library_path = create_or_get_temporary_photos_library()
-        click.echo(f"Temporary Photos library at: {temp_library_path}")
-    else:
-        temp_library_path = str(get_temp_photos_library_dir() / TEMPLATE_LIBRARY)
+    temp_library_path = create_or_get_temporary_photos_library()
+    click.echo(f"Temporary Photos library at: {temp_library_path}")
 
     click.confirm(
         "Please open Photos while holding down the Option key then select the temporary working library.\n"
@@ -570,18 +584,18 @@ def main(
             abort=True,
         )
 
-    # while not verify_temp_library_signature():
-    #     click.secho(
-    #         "Photos library missing sentinel value--does not appear to be temporary library. "
-    #         "Are you sure you opened the right library?",
-    #         err=True,
-    #         fg="red",
-    #     )
-    #     click.confirm(
-    #         "Please open Photos while holding down the Option key then select the temporary working library.\n"
-    #         "Type 'y' when you have done this.",
-    #         abort=True,
-    #     )
+    while not verify_temp_library_signature():
+        click.secho(
+            "Photos library missing sentinel value--does not appear to be temporary library. "
+            "Are you sure you opened the right library?",
+            err=True,
+            fg="red",
+        )
+        click.confirm(
+            "Please open Photos while holding down the Option key then select the temporary working library.\n"
+            "Type 'y' when you have done this.",
+            abort=True,
+        )
 
     click.echo("Reading data for referenced files from target library")
     referenced_files = read_file_locations_from_photos_database(photos_db_path)
